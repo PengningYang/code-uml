@@ -1,0 +1,45 @@
+@startuml
+title Spring Cloud Nacos Client 服务注册与订阅时序图（含 gRPC 实现）
+
+participant "Spring Boot 应用" as App
+participant "NacosServiceRegistry" as Registry
+participant "NamingGrpcClientProxy" as GrpcProxy
+participant "Nacos Server" as Server
+
+autonumber
+== **初始化阶段** ==
+App -> Registry: 1. 启动应用\n(发布 **WebServerInitializedEvent**)
+Registry -> Registry: 2. 监听事件\n(AbstractAutoServiceRegistration#**onApplicationEvent**)
+Registry -> Registry: 3. 调用 **start()**\n触发注册流程
+
+== **服务注册阶段 (gRPC)** ==
+Registry -> GrpcProxy: 4. **registerInstance()**\n(服务名/IP/端口/临时实例=true)
+GrpcProxy -> Server: 5. gRPC 请求\n(**/v1/ns/instance/register**)\n[协议: Distro]
+Server -> Server: 6. 存储实例\n(内存注册表 **ServiceManager**)
+Server -> Server: 7. 发布事件\n(**ClientRegisterServiceEvent**)
+Server --> GrpcProxy: 8. 返回 **SUCCESS**
+GrpcProxy --> Registry: 9. 注册成功
+
+== **服务订阅阶段** ==
+App -> GrpcProxy: 10. 首次订阅请求\n(**subscribe(serviceName, listener)**)
+GrpcProxy -> Server: 11. gRPC 长连接订阅\n(**/v1/ns/instance/list**)
+Server -> Server: 12. 缓存订阅关系\n(**SubscriberManager**)
+Server --> GrpcProxy: 13. 返回初始服务列表\n(**ServiceInfo**)
+GrpcProxy -> App: 14. 更新本地缓存\n(**ServiceInfoHolder**)
+
+== **定时拉取机制** ==
+loop 每6秒定时拉取
+    GrpcProxy -> Server: 15. **主动拉取服务列表**\n(UpdateTask#run())\n[默认间隔: 6秒]
+    Server --> GrpcProxy: 16. 返回最新实例列表
+    alt 列表有变更
+        GrpcProxy -> App: 17. 更新本地缓存\n(**ServiceInfoHolder**)
+        App -> App: 18. 发布 **InstancesChangeEvent**\n(刷新Ribbon负载均衡器)
+    end
+end
+
+== **服务端主动推送** ==
+loop 监听变更
+    Server -> GrpcProxy: 19. gRPC 推送变更\n(**ServiceChangedEvent**)
+    GrpcProxy -> App: 20. 触发 **InstancesChangeEvent**\n(更新Ribbon缓存)
+end
+@enduml

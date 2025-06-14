@@ -1,0 +1,89 @@
+@startuml
+!theme plain
+skinparam backgroundColor #F9F9F9
+skinparam sequence {
+  ArrowColor #333333
+  ActorBorderColor #333333
+  LifeLineBorderColor #333333
+  LifeLineBackgroundColor #FFFFFF
+  ParticipantBorderColor #333333
+  ParticipantBackgroundColor #FFFFFF
+  ParticipantFontName Arial
+  ParticipantFontSize 13
+  ActorFontColor #333333
+  ActorFontSize 13
+}
+
+actor "Client (TM/RM)" as Client
+participant "NettyRemotingServer" as NettyServer
+participant "ProtocolV1Decoder" as Decoder
+participant "ServerHandler" as Handler
+participant "ServerOnRequestProcessor" as Processor
+participant "DefaultCoordinator" as Coordinator
+participant "DefaultCore" as Core
+participant "SessionManager" as SessionMgr
+participant "GlobalSession" as GlobalSession
+participant "TransactionStoreManager" as StoreMgr
+
+autonumber
+
+Client -> NettyServer : 1. 发送事务请求字节流
+NettyServer -> Decoder : 2. 解码请求(decode)
+Decoder -> Decoder : 3. 解析协议头[9](@ref)
+Decoder -> Decoder : 4. 处理TCP粘包/拆包[9](@ref)
+Decoder -> Handler : 5. 返回AbstractTransactionRequest
+
+Handler -> Processor : 6. 路由请求(process)
+Processor -> Coordinator : 7. 委托处理(handler)
+
+alt 全局事务请求
+    Coordinator -> Core : 8. begin()
+    Core -> SessionMgr : 9. addGlobalSession()
+    SessionMgr -> GlobalSession : 10. 创建会话
+    SessionMgr -> StoreMgr : 11. writeSession(CREATE)
+    StoreMgr --> SessionMgr : 12. 持久化结果
+    SessionMgr --> Core : 13. 操作完成
+    Core --> Coordinator : 14. 返回XID
+else 分支事务请求
+    Coordinator -> Core : 8. branchRegister()
+    Core -> SessionMgr : 9. findGlobalSession(xid)
+    SessionMgr -> StoreMgr : 10. readSession(xid)
+    StoreMgr --> SessionMgr : 11. 返回会话
+    SessionMgr --> Core : 12. 返回GlobalSession
+    Core -> GlobalSession : 13. addBranchSession()
+    SessionMgr -> StoreMgr : 14. writeSession(UPDATE)
+    StoreMgr --> SessionMgr : 15. 持久化结果
+    SessionMgr --> Core : 16. 操作完成
+    Core --> Coordinator : 17. 返回BranchID
+end
+
+Coordinator --> Processor : 18. 响应数据
+Processor --> Handler : 19. 封装响应
+Handler --> NettyServer : 20. 写回响应
+NettyServer --> Client : 21. 返回事务响应
+
+note right of Decoder
+  ​**协议解码关键步骤**：
+  1. 校验魔数
+  2. 解析协议版本
+  3. 根据typeCode创建具体请求对象
+  4. 反序列化业务数据[9](@ref)
+end note
+
+note over Coordinator,Core
+  ​**事务协调核心**：
+  - 全局事务：创建会话树
+  - 分支事务：添加分支节点
+  - 状态持久化保障ACID[7](@ref)
+end note
+
+note over SessionMgr,StoreMgr
+  ​**会话生命周期管理**：
+  1. 创建/更新会话状态
+  2. 多存储模式支持：
+     - 文件(默认)
+     - 数据库
+     - Redis[7](@ref)
+  3. 状态变更通知
+end note
+@enduml

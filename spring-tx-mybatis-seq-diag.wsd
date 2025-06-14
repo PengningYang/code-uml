@@ -1,0 +1,102 @@
+@startuml
+' 启用自动编号和分组优化
+autonumber
+skinparam sequenceParticipant underline
+skinparam LifeLineBackgroundColor #F0F8FF
+hide footbox
+
+' ==== 按交互顺序从左到右排列参与者 ====
+box "Spring 事务控制层" #lightblue
+  participant "Service" as Service order 1
+  participant "TransactionInterceptor" as TI order 2
+  participant "DataSourceTransactionManager" as DTM order 3
+  participant "TransactionSynchronizationManager" as TSM order 4
+end box
+
+box "MyBatis 资源管理层" #lightyellow
+  participant "SqlSessionTemplate" as SST order 5
+  participant "SqlSessionInterceptor" as SSI order 6
+  participant "SqlSessionUtils" as SSU order 7
+  participant "SqlSessionFactory" as SSF order 8
+  participant "SqlSessionSynchronization" as Sync order 9
+  participant "SqlSession" as SqlSession order 10
+end box
+
+box "JDBC 连接层" #mistyrose
+  participant "SpringManagedTransaction" as SMT order 11
+  participant "ConnectionHolder" as CH order 12
+  participant "Connection" as Connection order 13
+end box
+
+' ==== 事务开启阶段 ====
+activate Service #FFBBBB
+Service -> TI: 调用@Transactional方法
+activate TI #FFBBBB
+TI -> DTM: 1. getTransaction()
+activate DTM #FFBBBB
+DTM -> DTM: doBegin()
+DTM -> CH: 从DataSource获取Connection
+DTM -> TSM: bindResource(dataSource, ConnectionHolder)
+DTM --> TI: 返回TransactionStatus
+deactivate DTM
+TI --> Service: 执行业务方法
+deactivate TI
+
+' ==== SQL执行阶段 ====
+activate Service #FFBBBB
+Service -> SST: 执行Mapper方法
+activate SST #FFBBBB
+SST -> SSI: 拦截调用（动态代理）
+activate SSI #FFBBBB
+SSI -> SSU: 2. getSqlSession()
+activate SSU #FFBBBB
+
+SSU -> TSM: getResource(SqlSessionFactory)
+TSM --> SSU: 返回SqlSessionHolder\n（首次为null）
+
+alt 首次调用，无SqlSessionHolder
+  SSU -> SSF: 3. openSession()
+  activate SSF #FFBBBB
+  SSF -> SMT: 创建SpringManagedTransaction
+  SMT -> TSM: 4. getResource(dataSource)
+  TSM --> SMT: 返回ConnectionHolder
+  SSF --> SSU: 返回SqlSession
+  deactivate SSF
+  SSU -> TSM: bindResource(SqlSessionFactory, SqlSessionHolder)
+  SSU -> TSM: registerSynchronization(Sync)  ' 同步器注册
+  activate Sync #FFBBBB
+end
+SSU --> SSI: 返回SqlSession
+deactivate SSU
+
+SSI -> SqlSession: 5. 执行SQL
+activate SqlSession #FFBBBB
+SqlSession -> SMT: 获取Connection
+SMT --> SqlSession: 返回Connection
+SqlSession -> Connection: 执行SQL
+Connection --> SqlSession: 返回结果
+deactivate SqlSession
+SSI --> SST: 返回结果
+deactivate SSI
+SST --> Service: 返回结果
+deactivate SST
+
+' ==== 事务提交阶段 ====
+Service --> TI: 方法返回（无异常）
+activate TI #FFBBBB
+TI -> DTM: 6. commit()
+activate DTM #FFBBBB
+DTM -> TSM: 触发beforeCommit()
+TSM -> Sync: beforeCommit()  ' 直接调用同步器
+Sync -> SqlSession: commit()\n（空操作）
+DTM -> DTM: 提交Connection
+DTM -> TSM: 触发afterCompletion()
+TSM -> Sync: afterCompletion()  ' 资源清理入口
+Sync -> SSU: 7. closeSqlSession()\n（引用计数-1）
+SSU -> TSM: unbindResource()  ' 显式解绑资源
+deactivate Sync
+deactivate DTM
+TI --> Service: 返回
+deactivate TI
+deactivate Service
+@enduml

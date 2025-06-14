@@ -1,0 +1,82 @@
+@startuml
+!theme plain
+skinparam classFontSize 13
+skinparam classAttributeIconSize 0
+
+package "Connector (连接器)" {
+  class ProtocolHandler {
+    + Endpoint endpoint
+    + Processor processor
+    + Adapter adapter
+    + start() : void
+  }
+
+  class Endpoint <<Abstract>> {
+    + Acceptor[] acceptors
+    + Poller[] pollers
+    + Executor executor
+    + startInternal() : void
+  }
+
+  class NioEndpoint {
+    + getExecutor() : Executor
+    + createExecutor() : void
+  }
+
+  class Executor <<ThreadPool>> {
+    + execute(Runnable) : void
+  }
+
+  class TaskQueue {
+    + force(Runnable) : boolean
+  }
+}
+
+package "Container (容器)" {
+  class ContainerBase {
+    + backgroundProcessor() : void
+  }
+
+  class StandardThreadExecutor {
+    + ThreadPoolExecutor executor
+    + execute(Runnable) : void
+  }
+}
+
+ProtocolHandler *-- Endpoint
+ProtocolHandler *-- Processor
+ProtocolHandler *-- Adapter
+
+Endpoint <|-- NioEndpoint
+Endpoint o-- Executor : 1..1
+Endpoint o-- Acceptor : 1..*
+Endpoint o-- Poller : 1..*
+
+NioEndpoint o-- TaskQueue : 1..1
+
+Executor <|.. StandardThreadExecutor
+StandardThreadExecutor o-- ThreadPoolExecutor : 1..1
+
+ContainerBase --> StandardThreadExecutor : 后台任务处理
+
+note top of Endpoint
+  ​**线程池关键配置：​**
+  - acceptorThreadCount：Acceptor 线程数（默认1）
+  - pollerThreadCount：Poller 线程数（CPU核心数）
+  - maxThreads：工作线程最大值（默认200）
+  - minSpareThreads：核心线程数（默认10）
+end note
+
+note right of TaskQueue
+  ​**特殊队列行为：​**
+  1. 当线程数 < maxThreads 时拒绝入队
+  2. 队列长度 Integer.MAX_VALUE
+  3. 重写 offer() 控制任务分配策略[4,5](@ref)
+end note
+
+note left of StandardThreadExecutor
+  ​**容器级线程池：​**
+  处理后台任务（如Session过期）
+  独立于连接器线程池[7](@ref)
+end note
+@enduml

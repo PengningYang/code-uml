@@ -1,0 +1,295 @@
+@startuml
+!theme plain
+skinparam backgroundColor #F9F9F9
+skinparam class {
+    BackgroundColor #FFFFFF
+    BorderColor #333333
+    ArrowColor #333333
+    FontSize 13
+}
+
+package "container" {
+    package "Seata Client" {
+        class GlobalTransactionScanner #A9DFBF {
+            - enableAutoProxy: boolean
+            + postProcessAfterInitialization()
+            + wrapIfNecessary()
+        }
+        ' ===== 全局上下文 =====
+        class RootContext #D5DBDB {
+            + getXID(): String
+            + bind(xid: String): void
+            + unbind(): void
+            + inGlobalTransaction(): boolean
+        }
+        note right of GlobalTransactionScanner
+        ​**(客户端核心) 客户端入口处理器**
+        核心功能：
+        1. 扫描@GlobalTransactional注解
+        2. 创建事务代理对象
+        3. 初始化TM/RM客户端
+        配置属性：
+        - enableAutoProxy: 是否启用自动代理
+        - txServiceGroup: 事务组名称
+        end note
+        ' ===== TM组件 =====
+        package "TM" {
+            class TmNettyRemotingClient #A9DFBF {
+                - tmClientChannelManager: TmClientChannelManager
+                + init()
+                + sendMsgWithResponse()
+            }
+
+            annotation GlobalTransactional {
+                + timeoutMills()
+                + name()
+            }
+
+            class GlobalTransactionalInterceptorHandler #A9DFBF {
+                - failureHandler: FailureHandler
+                - transactionalTemplate: TransactionalTemplate
+                + invoke(methodInvocation)
+            }
+
+            class TransactionalTemplate {
+                - globalTransaction: GlobalTransaction
+                + execute(transactionalExecutor)
+                + beginTransaction()
+                + commit()
+                + rollback()
+            }
+            interface GlobalTransaction{
+                + begin()
+                + commit()
+                + rollback()
+            }
+            TransactionalTemplate ..> GlobalTransaction : manages
+            DefaultTransactionManager --|> GlobalTransaction
+            class DefaultTransactionManager #A9DFBF {
+                - globalTransaction: GlobalTransaction
+                + begin()
+                + commit()
+                + rollback()
+            }
+
+            DefaultTransactionManager --> TmNettyRemotingClient: sendSyncRequest
+
+
+            class XID{}
+
+
+
+            note top of TransactionalTemplate
+            ​**事务执行引擎**
+            核心职责：
+            1. 开启全局事务(beginTransaction)
+            2. 执行业务逻辑(execute)
+            3. 提交/回滚事务(commit/rollback)
+            特殊处理：
+            - 内嵌事务处理：识别全局事务发起者
+            - 异常回滚：捕获业务异常触发回滚
+            end note
+
+            note left of GlobalTransactionalInterceptorHandler
+            ​**事务拦截器**
+            工作流程：
+            1. 拦截@GlobalTransactional方法
+            2. 创建TransactionalTemplate实例
+            3. 执行事务模板：
+                - begin(): 开启全局事务
+                - business(): 执行业务逻辑
+                - commit/rollback(): 结束事务
+            4. 异常处理：调用failureHandler
+            end note
+        }
+
+        ' ===== RM组件 =====
+        package "RM" {
+            class RmNettyRemotingClient #D6EAF8 {
+                - resourceManager: ResourceManager
+                - transactionMessageHandler: TransactionMessageHandler
+                - rmClientChannelManager: RmClientChannelManager
+                + init()
+                + registerResource()
+            }
+
+            RmNettyRemotingClient o--> ResourceManager
+            RmNettyRemotingClient o--> TransactionMessageHandler
+
+            interface ResourceManager {
+                registerResource()
+            }
+            interface TransactionMessageHandler {
+                onRequest(request, context)
+                onResponse(request, context)
+            }
+
+            TransactionMessageHandler --> DataSourceResourceManager: branch_commit
+
+            DataSourceResourceManager --|> ResourceManager
+
+            class DataSourceResourceManager {
+                - dataSourceProxy: DataSourceProxy
+                - asyncWorker: AsyncWorker
+                + init()
+                + registerResource()
+            }
+
+            DataSourceResourceManager o--> DataSourceProxy
+            DataSourceResourceManager o--> AsyncWorker
+
+            class AsyncWorker #D6EAF8 {
+                - commitQueue: BlockingQueue
+                - scheduledExecutor: ScheduledExecutorService
+                + addAsyncCommit()
+            }
+
+            AsyncWorker --> UndoLogManager: deleteUndoLog
+
+            class DataSourceProxy #D6EAF8 {
+                - targetDataSource: DataSource
+                + getConnection()
+                + init()
+            }
+
+            class ConnectionProxy {
+                - targetConnection: Connection
+                + commit()
+                + rollback()
+                + setAutoCommit()
+                + prepareStatement() : PreparedStatementProxy
+            }
+
+            class PreparedStatementProxy #D6EAF8 {
+                - targetStatement: PreparedStatement
+                + executeUpdate() : int
+                + executeBatch() : int[]
+                + getParameters() : ArrayList<SQLParam>
+            }
+
+            abstract class BaseTransactionalExecutor {
+                # connectionProxy: ConnectionProxy
+                + execute(args: Object[])
+            }
+
+            class UndoLogManager #D6EAF8 {
+                + flushUndoLogs()
+                + deleteUndoLog()
+            }
+
+
+            note bottom of RmNettyRemotingClient
+            ​**RM通信客户端**
+            网络配置：
+            - Selector线程：1个（固定）
+            - Worker线程：CPU核心数×2
+            - 消息队列容量：20000（比TM大10倍）
+            核心能力：
+            1. 注册分支事务
+            2. 上报分支状态
+            3. 处理TC下发的分支指令：
+                ∙ 提交(RmBranchCommitProcessor)
+                ∙ 回滚(RmBranchRollbackProcessor)
+                ∙ undo日志(RmUndoLogProcessor)
+            线程命名：
+            - 消息处理线程：rpcDispatch_2
+            end note
+
+            note top of DataSourceProxy
+            ​**(RM核心) 数据源代理核心**
+            关键能力：
+            1. 拦截SQL执行
+            2. 生成undo log
+            3. 注册分支事务到TC
+            实现原理：
+            包装原生DataSource
+            创建ConnectionProxy
+            end note
+
+            note bottom of ConnectionProxy
+            ​**连接代理**
+            核心拦截点：
+            1. commit(): 分支提交
+            2. rollback(): 分支回滚
+            3. setAutoCommit(): 事务模式切换
+            4. prepareStatement(): 创建语句代理
+            在commit时：
+            - 生成undo log
+            - 向TC报告分支状态
+            end note
+
+            note bottom of PreparedStatementProxy
+            ​**SQL语句代理**
+            核心功能：
+            1. 拦截executeUpdate等DML操作
+            2. 捕获执行前后的数据镜像
+            3. 解析SQL参数绑定
+            生成undo log步骤：
+            → before image: 执行前查询
+            → SQL执行
+            → after image: 执行后查询
+            end note
+
+            note right of BaseTransactionalExecutor
+            ​**SQL执行器基类**
+            抽象方法：
+            + execute() 执行具体SQL
+            实现职责：
+            1. 通过ConnectionProxy获取数据库连接
+            2. 调用PreparedStatementProxy执行
+            3. 与UndoLogManager协作
+            具体实现类：
+            - UpdateExecutor: 更新操作
+            - DeleteExecutor: 删除操作
+            - InsertExecutor: 插入操作
+            end note
+
+
+        }
+    }
+
+    ' ===== 外部集成组件 =====
+    class SeataFeignClient {
+        - delegate: Client
+        + execute()
+    }
+
+    class SeataRestTemplateInterceptor {
+        + intercept()
+    }
+    class Connection {
+        + commit()
+        + rollback()
+        + setAutoCommit()
+        + prepareStatement()
+    }
+    class PreparedStatement {
+        + executeUpdate()
+        + executeBatch()
+    }
+}
+
+' ====== 近距离组合关系 ======
+DataSourceProxy *-- ConnectionProxy : creates
+ConnectionProxy *-- PreparedStatementProxy : creates
+PreparedStatementProxy --> BaseTransactionalExecutor : executes
+BaseTransactionalExecutor --> UndoLogManager : uses
+
+' ====== 核心事务管理关系 ======
+GlobalTransactionScanner --> TmNettyRemotingClient : manages TM
+GlobalTransactionScanner --> RmNettyRemotingClient : manages RM
+GlobalTransactionScanner *-- GlobalTransactionalInterceptorHandler : contains
+GlobalTransactionalInterceptorHandler *-- TransactionalTemplate : uses
+
+' ====== 注解处理 ======
+GlobalTransactionalInterceptorHandler ..> GlobalTransactional : processes
+
+SeataRestTemplateInterceptor ..> RootContext : propagates:xid
+SeataFeignClient ..> RootContext : propagates:xid
+
+
+' ====== 实现关系 ======
+ConnectionProxy --|> Connection
+PreparedStatementProxy --|> PreparedStatement
+
+@enduml

@@ -1,0 +1,129 @@
+@startuml
+!theme plain
+skinparam linetype ortho
+skinparam class {
+    BackgroundColor<<Interceptor>> #CCFFCC
+    BackgroundColor<<Support>>  #FFF9C4
+    BackgroundColor<<Extension>> #B0E0E6
+    BackgroundColor<<Default>> #FFFFFF
+    BorderColor #333333
+    ArrowColor #555555
+    FontSize 13
+}
+
+' ====== 核心接口 ======
+interface PlatformTransactionManager << (M,#555555) Manager >> {
+  + getTransaction(TransactionDefinition): TransactionStatus
+  + commit(TransactionStatus): void
+  + rollback(TransactionStatus): void
+}
+
+interface MethodInterceptor << (I,#555555) Interface >> {
+  + invoke(MethodInvocation): Object
+}
+
+' ====== 事务拦截器组 ======
+class TransactionInterceptor << (I,#CCE6FF) Interceptor >> {
+  - PlatformTransactionManager transactionManager
+  - TransactionAttributeSource transactionAttributeSource
+  + invoke(MethodInvocation): Object
+}
+
+class TransactionAspectSupport << (S,#CCFFCC) Support >> {
+  # invokeWithinTransaction(...): Object
+  # createTransactionIfNecessary(...): TransactionInfo
+}
+
+' ====== 事务上下文组 ======
+class TransactionInfo << (D,#FFFFFF) Default >> {
+  - PlatformTransactionManager transactionManager
+  - TransactionAttribute transactionAttribute
+  - TransactionStatus transactionStatus
+  - TransactionInfo oldTransactionInfo
+  + bindToThread(): void
+}
+
+' ====== 事务状态组 ======
+class DefaultTransactionStatus << (D,#FFFFFF) Default >> {
+  - Object transaction
+  - boolean newTransaction
+  - boolean rollbackOnly
+}
+
+' ====== 资源管理组 ======
+class ConnectionHolder << (S,#CCFFCC) Support >> {
+  - Connection connection
+  + getConnection(): Connection
+}
+
+class DataSourceTransactionObject << (D,#FFFFFF) Default >> {
+  - ConnectionHolder connectionHolder
+}
+
+' ====== 同步管理器 ======
+class TransactionSynchronizationManager << (I,#CCE6FF) Interceptor >> {
+  {static} - resources: ThreadLocal<Map<Object, Object>>
+  {static} - synchronizations: ThreadLocal<Set<TransactionSynchronization>>
+  {static} + bindResource(key, value): void
+  {static} + getResource(key): Object
+  {static} + registerSynchronization(sync): void
+}
+
+' ====== 事务同步接口 ======
+interface TransactionSynchronization << (E,#FFFFCC) Extension >> {
+  + beforeCommit(boolean readOnly): void
+  + afterCommit(): void
+  + beforeCompletion(): void
+  + afterCompletion(int status): void
+}
+
+' ====== 数据源组 ======
+class DataSource << (E,#FFFFCC) Extension >> {
+  + getConnection(): Connection
+}
+
+class Connection << (D,#FFFFFF) Default >> {
+  + commit(): void
+  + rollback(): void
+}
+
+' ====== 继承关系 ======
+MethodInterceptor <|.. TransactionInterceptor
+TransactionAspectSupport <|-- TransactionInterceptor
+
+' ====== 依赖关系 ======
+TransactionInfo --> PlatformTransactionManager : 依赖
+TransactionInfo --> DefaultTransactionStatus : 持有
+TransactionInfo --> TransactionAttribute : 持有
+
+' ====== 创建关系 ======
+TransactionInterceptor --> TransactionAspectSupport : 继承
+TransactionInterceptor --> TransactionInfo : 创建
+
+' ====== 包含关系 ======
+DefaultTransactionStatus --> DataSourceTransactionObject : 包含
+DataSourceTransactionObject --> ConnectionHolder : 包含
+ConnectionHolder --> Connection : 持有
+DataSource --> Connection : 创建
+
+' ====== 资源绑定 ======
+TransactionSynchronizationManager --> ThreadLocal : 依赖
+TransactionSynchronizationManager ..> ConnectionHolder : 存储资源
+TransactionSynchronizationManager ..> TransactionSynchronization : 管理回调
+
+' ====== 核心注释 ======
+note top of TransactionSynchronizationManager
+  <b>线程级事务资源管理</b>
+  ■ 绑定资源（如ConnectionHolder）
+  ■ 注册事务同步回调（如afterCommit）
+  ■ 存储事务状态（只读/隔离级别）
+end note
+
+note right of ThreadLocal
+  <b>线程隔离机制</b>
+  ■ 每个线程独立副本
+  ■ 跨Service/Dao层共享Connection
+  ■ 嵌套事务保存外层状态
+end note
+
+@enduml

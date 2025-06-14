@@ -1,0 +1,89 @@
+@startuml
+title Spring Cloud Nacos Client 配置中心核心类时序图（gRPC通信版）
+
+participant "Spring Boot 应用" as App
+participant "PropertySourceBootstrapConfiguration" as Bootstrap
+participant "NacosPropertySourceLocator" as Locator
+participant "NacosConfigService" as ConfigService
+participant "ClientWorker" as Worker
+participant "ConfigGrpcClient" as GrpcClient
+participant "CacheData" as Cache
+participant "FailoverReactor" as Failover
+participant "NacosContextRefresher" as Refresher
+participant "RefreshEventListener" as Listener
+participant "ApplicationContext" as Context
+participant "Nacos Server" as Server
+
+autonumber
+== **初始化阶段** ==
+App -> Bootstrap: 1. 启动应用\n触发**ApplicationContextInitializer**[2,4]
+Bootstrap -> Locator: 2. 调用**locate()**\n加载配置源[2,5]
+Locator -> ConfigService: 3. 创建**ConfigService**实例[2,3]
+ConfigService -> Worker: 4. 初始化**ClientWorker**[3,8]
+Worker -> GrpcClient: 5. 建立**gRPC双向流**\n(长连接通道)[6,7]
+note right: 使用TLS加密通信\n默认端口9848
+
+== **配置加载阶段** ==
+Locator -> ConfigService: 6. 调用**getConfig()**\n获取远程配置[2,5]
+alt 首次加载
+    ConfigService -> GrpcClient: 7. 发起gRPC请求\n(ConfigQueryRequest)
+    GrpcClient -> Server: 8. gRPC远程调用
+    alt 服务端可达
+        Server --> GrpcClient: 9. 返回ConfigResponse\n(含配置内容)
+        GrpcClient -> Cache: 10. 缓存到本地\n**${user.home}/nacos/config/**[1,4]
+        Cache --> ConfigService: 11. 返回配置数据
+    ConfigService -> Locator: 12. 返回配置数据
+    Locator -> Bootstrap: 13. 封装为**NacosPropertySource**[2,5]
+    Bootstrap -> Context: 14. 注入**Environment**[2,4]
+end
+
+== **动态监听阶段** ==
+group **gRPC持续监听** [双向流][6,7]
+    Server -> GrpcClient: 15. 主动推送变更\n(ConfigChangeNotify)
+    GrpcClient -> Worker: 16. 解析变更通知
+end
+
+group **定时检查配置变更状态** [后台]
+   loop **5s一检查<有event立即检查>、3m一全量同步**
+       Worker -> Worker: 16x. 检查配置变更状态
+       alt 有变更
+           Worker -> GrpcClient: 18. 请求最新配置,发送ConfigQueryRequest
+           GrpcClient -> Server: 19. gRPC远程调用
+           Server --> GrpcClient: 20. 返回最新配置
+           GrpcClient -> Cache: 21. 更新本地缓存\n和快照文件
+           Worker -> Refresher: 22. 触发**refresh()**[2,3]
+       end
+   end
+end
+
+== **配置刷新阶段** ==
+Refresher -> Refresher: 23. 发布**RefreshEvent**[2,5]
+Listener -> Listener: 24. 监听事件\n调用**refresh()**[2]
+group **配置更新流程** [2,5]
+    Listener -> Context: 25. 重建Environment
+    Context -> Context: 26. (旧版)模拟SpringApplication.run()重新加载配置源\n(新版)**精细化更新配置**
+    Context -> Context: 27. 销毁**@RefreshScope** Bean[5,14]
+    Context -> Context: 28. 发布EnvironmentChangeEvent
+end
+== **容错机制(容灾->rpc查询->snapshot)** ==
+
+group **Failover容灾** [9,11]
+    loop 每5秒
+        Failover -> Failover: 32. 监控容灾开关\n**SwitchRefresher**
+    end
+    alt 网络恢复
+        Worker -> GrpcClient: 33. 重建gRPC连接
+        GrpcClient -> Server: 34. 重新订阅配置
+        Server --> GrpcClient: 35. 返回全量配置
+        GrpcClient -> Cache: 36. 覆盖本地缓存
+        GrpcClient -> Failover: 37. 更新备份文件
+    end
+end
+
+group **本地缓存兜底** [1,4]
+    alt 服务端不可达
+        ConfigService -> Cache: 29. 读取本地快照\n(snapshot文件)
+        Cache --> ConfigService: 30. 返回缓存配置
+    end
+end
+@enduml

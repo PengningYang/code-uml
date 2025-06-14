@@ -1,0 +1,111 @@
+@startuml
+!theme plain
+skinparam backgroundColor #F9F9F9
+skinparam sequence {
+    ArrowColor #333333
+    ParticipantBackgroundColor #FFFFFF
+    ParticipantBorderColor #333333
+    ActorBackgroundColor #E6F7FF
+    ActorBorderColor #0066CC
+    LifeLineBackgroundColor #F9F9F9
+}
+' ===== 定义颜色变量 =====
+!define PHASE1 #D6EAF8  ' 事务启动阶段
+!define PHASE2 #D5F5E3  ' 分支事务执行
+!define PHASE3 #FEF9E7  ' 全局事务结束
+!define EXCEPTION #FADBD8 ' 异常处理
+
+
+actor User as user
+participant "BusinessService" as biz
+participant "GlobalTransactional\nInterceptorHandler" as interceptor
+participant "TransactionalTemplate" as template
+participant "DefaultTransactionManager" as tm_manager
+participant "TmNettyRemoting\nClient" as tm_client
+participant "DataSourceProxy" as ds_proxy
+participant "ConnectionProxy" as conn_proxy
+participant "PreparedStatement\nProxy" as stmt_proxy
+participant "AsyncWorker" as async_worker
+participant "RmNettyRemoting\nClient" as rm_client
+database "TC(Seata Server)" as tc
+participant "RootContext" as root_context
+
+' ====== 事务启动阶段 ======
+group PHASE1
+user -> biz ++: 调用@GlobalTransactional方法
+biz -> interceptor ++: 方法拦截
+interceptor -> template ++: 创建事务模板
+template -> tm_manager ++: beginTransaction()
+tm_manager -> tm_client ++: 开启全局事务
+tm_client -> tc ++: 注册全局事务(GTX begin)
+tc --> tm_client --: 返回XID
+tm_client -> root_context : 绑定XID
+tm_client --> tm_manager --:
+tm_manager --> template --:
+template --> interceptor --:
+interceptor --> biz --:
+end group
+
+' ====== 分支事务执行阶段 ======
+group PHASE2
+biz -> ds_proxy ++: getConnection()
+ds_proxy -> conn_proxy ++: 创建连接代理
+conn_proxy --> ds_proxy --:
+ds_proxy --> biz --:
+biz -> conn_proxy ++: prepareStatement(SQL)
+conn_proxy -> stmt_proxy ++: 创建语句代理
+stmt_proxy --> conn_proxy --:
+conn_proxy --> biz --:
+biz -> stmt_proxy ++: executeUpdate()
+stmt_proxy -> stmt_proxy: 解析SQL\n生成before image[4](@ref)
+stmt_proxy -> stmt_proxy: 执行真实SQL
+stmt_proxy -> stmt_proxy: 生成after image\n和undo log[4](@ref)
+stmt_proxy -> rm_client ++: 注册分支事务
+rm_client -> tc ++: 注册分支(BranchRegister)
+tc --> rm_client --: 返回branchId
+rm_client --> stmt_proxy --:
+stmt_proxy -> conn_proxy: 准备提交
+stmt_proxy --> biz --:
+biz -> conn_proxy ++: commit()
+conn_proxy -> conn_proxy: 本地事务提交\n(业务SQL+undo log)[6](@ref)
+conn_proxy -> rm_client ++: 上报分支状态
+rm_client -> tc ++: 分支状态报告
+tc --> rm_client --:
+rm_client --> conn_proxy --:
+conn_proxy --> biz --:
+end group
+
+' ====== 全局事务提交阶段 ======
+group PHASE3
+biz -> interceptor ++: 方法返回
+interceptor -> template ++: commit()
+template -> tm_manager ++: 全局提交决议
+tm_manager -> tm_client ++: 全局提交请求
+tm_client -> tc ++: GlobalCommit请求
+tc -> rm_client ++: 异步提交分支
+rm_client -> async_worker ++: 删除undo log
+async_worker -> conn_proxy ++: 清理快照数据
+conn_proxy -> conn_proxy: 删除undo log[7](@ref)
+conn_proxy --> async_worker --:
+async_worker --> rm_client --:
+rm_client --> tc --:
+tc --> tm_client --:
+tm_client --> tm_manager --:
+tm_manager --> template --:
+template --> interceptor --:
+interceptor --> user --: 业务完成
+end group
+
+' ====== 异常处理路径 ======
+group EXCEPTION
+biz -> interceptor: 抛出异常
+interceptor -> template: rollback()
+template -> tm_manager: 全局回滚决议
+tm_manager -> tm_client: 全局回滚请求
+tm_client -> tc: GlobalRollback请求
+tc -> rm_client: 分支回滚请求
+rm_client -> conn_proxy: 执行undo log补偿
+conn_proxy -> conn_proxy: 使用before image恢复数据[8](@ref)
+end group
+
+@enduml
