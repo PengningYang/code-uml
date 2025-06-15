@@ -1,0 +1,253 @@
+@startuml Server端核心架构类图
+!theme plain
+title Nacos Server端核心架构类图
+
+' ======================
+' 事件驱动模块
+' ======================
+package "事件驱动模块" {
+    interface Event {
+        + getEventType(): String
+    }
+    class ConfigDataChangeEvent
+    class LocalDataChangeEvent
+    class MetadataChangeEvent
+
+    Event <|-- ConfigDataChangeEvent
+    Event <|-- LocalDataChangeEvent
+    Event <|-- MetadataChangeEvent
+
+    class NotifyCenter {
+        + publishEvent(Event event)
+        + registerSubscriber(Subscriber subscriber)
+    }
+
+    interface Subscriber {
+        + onEvent(Event event)
+        + subscribeType(): Class<? extends Event>
+    }
+    class ConfigChangePublisher <<订阅者>>
+    class ClientRpcNotifySubscriber <<订阅者>>
+    class HealthCheckSubscriber <<订阅者>>
+
+    Subscriber <|.. ConfigChangePublisher
+    Subscriber <|.. ClientRpcNotifySubscriber
+    Subscriber <|.. HealthCheckSubscriber
+
+    NotifyCenter --> "*" Subscriber
+}
+
+' ======================
+' gRPC通信层
+' ======================
+package "gRPC通信层" {
+    abstract class BaseGrpcServer {
+        + start()
+        + stop()
+        # addServices()
+    }
+
+    class GrpcSdkServer {
+        + rpcPortOffset(): int = 1000
+    }
+
+    class GrpcClusterServer {
+        + rpcPortOffset(): int = 1001
+    }
+
+    BaseGrpcServer <|-- GrpcSdkServer
+    BaseGrpcServer <|-- GrpcClusterServer
+
+    class GrpcRequestAcceptor {
+        + request(Payload payload)
+        + routeToHandler()
+    }
+
+    class GrpcBiStreamRequestAcceptor {
+        + requestBiStream(stream Payload)
+        + establishConnection()
+    }
+
+    class ConnectionManager {
+        + addConnection(Connection conn)
+        + removeConnection(String connId)
+        + getActiveConnections(): List<Connection>
+        + checkConnectionHealth()
+    }
+
+    class RuntimeConnectionEjector {
+        + scanUnhealthyConnections()
+        + ejectConnection(Connection conn)
+    }
+
+    class Connection {
+        - connectionId: String
+        - lastActiveTime: long
+        - status: ConnectionStatus
+        + sendMessage(Message msg)
+        + close()
+    }
+
+    BaseGrpcServer --> GrpcRequestAcceptor : 注册处理器
+    BaseGrpcServer --> GrpcBiStreamRequestAcceptor : 注册双向流
+    ConnectionManager "1" o--> "*" Connection
+}
+
+' ======================
+' 集群一致性协议
+' ======================
+package "集群协议" {
+   
+    class DistroProtocol {
+        + dataSharding()
+        + syncToNextNode()
+        + handleSyncResponse()
+    }
+
+    class RaftProtocol {
+        + leaderElection()
+        + logReplication()
+        + commitIndex()
+    }
+
+    class DistroMapper {
+        + mapToNode(key): Node
+    }
+
+    DistroProtocol --> DistroMapper : 分片路由
+}
+
+' ======================
+' 配置持久化
+' ======================
+package "持久化模块" {
+    abstract class DumpService {
+        + dumpAll()
+        + dumpDelta()
+    }
+
+    class EmbeddedDumpService {
+        + dumpToDerby()
+    }
+
+    class ExternalDumpService {
+        + dumpToMySQL()
+    }
+
+    DumpService <|-- EmbeddedDumpService
+    DumpService <|-- ExternalDumpService
+
+    class DiskStorage {
+        + writeSnapshot()
+        + readSnapshot()
+    }
+
+    class MySQLStorage {
+        + persistConfig()
+        + queryConfig()
+    }
+
+    EmbeddedDumpService --> DiskStorage : 本地存储
+    ExternalDumpService --> MySQLStorage : 数据库存储
+}
+
+' ======================
+' 任务执行引擎
+' ======================
+package "任务执行引擎" {
+    interface NacosTask {
+        + shouldProcess(): boolean
+    }
+
+    abstract class AbstractDelayTask
+    abstract class AbstractExecuteTask
+
+    class PushDelayTask
+    class PushExecuteTask
+
+    NacosTask <|-- AbstractDelayTask
+    NacosTask <|-- AbstractExecuteTask
+    AbstractDelayTask <|-- PushDelayTask
+    AbstractExecuteTask <|-- PushExecuteTask
+
+    interface NacosTaskProcessor {
+        + process(NacosTask task): boolean
+    }
+
+    class PushDelayTaskProcessor
+
+    class NacosTaskExecuteEngine {
+        + addTask(Object key, NacosTask task)
+        + processTasks()
+    }
+
+    class NacosDelayTaskExecuteEngine {
+        - delayQueue: DelayQueue<AbstractDelayTask>
+    }
+
+    class PushExecutorRpcImpl {
+        + push(PushRequest request)
+    }
+
+    class RpcPushService{
+        + doPushWithCallback(PushRequest request)
+    }
+    ConfigChangePublisher --> ClientRpcNotifySubscriber : 触发通知\n(LocalDataChangeEvent)[3]
+    ClientRpcNotifySubscriber --> NacosTaskExecuteEngine : 创建PushDelayTask[3]
+    NacosTaskExecuteEngine --> PushDelayTaskProcessor : 处理任务[3]
+    PushDelayTaskProcessor --> PushExecutorRpcImpl : 执行推送
+    PushExecutorRpcImpl --> RpcPushService : 处理推送任务
+
+
+    NacosTaskExecuteEngine <|-- NacosDelayTaskExecuteEngine
+    PushDelayTaskProcessor ..|> NacosTaskProcessor
+}
+
+package "业务核心模块" {
+    class PersistentClientOperationServiceImpl {
+        
+    }
+    class EphemeralClientOperationServiceImpl{
+
+    }
+
+    class ConfigOperationService{
+        + getConfig(String dataId, String group, String tenant): Config
+        + publishConfig(Config config): boolean
+        + removeConfig(String dataId, String group, String tenant): boolean
+    }
+}
+ConfigOperationService --> RaftProtocol : 内嵌数据库使用Raft
+PersistentClientOperationServiceImpl --> RaftProtocol
+EphemeralClientOperationServiceImpl --> DistroProtocol
+
+
+' ======================
+' 关联关系
+' ======================
+
+RpcPushService --> Connection : 推送客户端**sendMessage**()[9]
+GrpcBiStreamRequestAcceptor --> ConnectionManager : 注册新连接[9]
+ConnectionManager --> RuntimeConnectionEjector : 定时扫描(每3s)[11]
+RaftProtocol --> EmbeddedDumpService : 强一致性存储[3]
+
+note top of DistroProtocol
+    ​**AP模式特性**
+    1. 数据分片存储（每个节点负责部分服务）
+    2. 定时同步
+    3. 最终一致性保证:异步消息
+end note
+
+note TOP of RaftProtocol
+    ​**CP模式特性**
+    1. Leader选举（心跳丢失时触发）
+    2. 日志复制（多数派确认）
+    3. 强一致性保证:阻塞等待10s
+end note
+
+note top of DumpService
+    ​**双模式持久化**
+    ├─ Embedded模式：轻量级Derby存储
+    └─ External模式：生产级MySQL集群
+end note
+@enduml
